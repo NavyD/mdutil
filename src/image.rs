@@ -1,8 +1,3 @@
-use anyhow::{anyhow, Error, Result};
-use futures::AsyncBufReadExt;
-use once_cell::sync::Lazy;
-use regex::{Captures, Regex};
-use reqwest::Client;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::format;
@@ -13,6 +8,12 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
 };
+
+use anyhow::{anyhow, Error, Result};
+use futures::AsyncBufReadExt;
+use once_cell::sync::Lazy;
+use regex::{Captures, Regex};
+use reqwest::Client;
 use strum_macros::{Display, EnumString};
 use tokio::fs as afs;
 use url::Url;
@@ -49,14 +50,7 @@ impl FromStr for Link {
             Err(e) => log::trace!("invalid url for link: {}, error: {}", link, e),
         };
 
-        let p = Path::new(&link);
-        // check if exists
-        if let Err(e) = p.canonicalize() {
-            log::debug!("invalid local path for link: {}, error: {}", link, e);
-            Err(anyhow!("link {} is not url or path type", link))
-        } else {
-            Ok(Link::Local(p.to_path_buf()))
-        }
+        Ok(Link::Local(Path::new(&link).to_path_buf()))
     }
 }
 
@@ -105,6 +99,7 @@ impl TryFrom<&[u8]> for ImageFormat {
 
 pub struct Converter {
     client: Client,
+    base_path: PathBuf,
 }
 
 impl Converter {
@@ -113,10 +108,10 @@ impl Converter {
             .connect_timeout(Duration::from_secs(2))
             .build()
             .expect("client build error");
-        Self { client }
+        Self { client,  base_path: std::env::current_dir().unwrap()}
     }
 
-    pub async fn convert_base64(&self, text: &str, link_type: LinkType) -> Result<String> {
+    pub async fn to_base64(&self, text: &str, link_type: LinkType) -> Result<String> {
         // 1. get all links with key caps[0]
         let jobs = RE_IMAGE
             .captures_iter(text)
@@ -181,6 +176,67 @@ impl Converter {
 
         // 5. replace links with key val and append base64 to the end
         Ok(replace(text, &links))
+    }
+
+    pub async fn check(&self, path: impl AsRef<Path>, link_type: LinkType) -> Result<()> {
+        let jobs = RE_IMAGE
+            .captures_iter(&read_to_string(&path)?)
+            .map(|caps| {
+                (
+                    caps[0].to_string(),
+                    caps.get(2)
+                        .ok_or_else(|| anyhow!("Unable to index 2 in regex: {}", RE_IMAGE.as_str()))
+                        .and_then(|s| s.as_str().parse::<Link>()),
+                )
+            })
+            .filter(|(_, link)| link.is_ok())
+            .map(|(all, link)| (all, link.unwrap()))
+            .map(|(all, link)| {
+                if let Link::Local(p) = &link {
+                    if p.is_relative() {
+                        let new_path = path.as_ref().parent().unwrap().join(p);
+                        log::info!("new path: {}", new_path.to_str().unwrap());
+                        return (all, Link::Local(new_path));
+                    }
+                }
+                (all, link)
+            })
+            // 2. filter by link_type and check link
+            .filter(|(_, link)| {
+                matches!(
+                    (link, &link_type),
+                    (Link::Local(_), LinkType::All | LinkType::Local)
+                        | (Link::Net(_), LinkType::All | LinkType::Net)
+                )
+            })
+            .map(|(all, link)| {
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    // log::trace!("checking if link {:?} is available", link);
+                    if let Err(e) = check_link(&client, &link).await {
+                        Err(anyhow!("found link {} is unavailable: {}", link, e))
+                    } else {
+                        Ok(all)
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        futures::future::join_all(jobs)
+            .await
+            .into_iter()
+            .map(|res| res.map_err(Into::into).and_then(|v| v))
+            .for_each(|res| {
+                match res {
+                    Ok(link) => {
+                        println!("available link: {}", link);
+                    },
+                    Err(e) => {
+                        eprintln!("unavailable: {}", e);
+                    }
+                }
+            });
+        Ok(())
     }
 }
 
@@ -346,10 +402,20 @@ the test
     static CLIENT: Lazy<Client> = Lazy::new(|| Client::builder().build().unwrap());
 
     #[tokio::test]
+    async fn test_check() -> Result<()> {
+        let converter = Converter::new();
+        // converter.check(DATA, LinkType::All).await?;
+
+        converter.check("/home/navyd/Workspaces/projects/blog-resources/java/source-code/datastructure/HashMap.md", LinkType::All).await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn convert_image_to_base64() -> Result<()> {
         let converter = Converter::new();
         let old = DATA;
-        let new = converter.convert_base64(old, LinkType::All).await?;
+        let new = converter.to_base64(old, LinkType::All).await?;
         assert!(!new.is_empty());
         assert!(new.len() > old.len());
         assert!(new.lines().count() > old.lines().count());
@@ -359,14 +425,14 @@ the test
         assert!(new.contains("![not exist image](test/_not_exists_test.png)"));
         assert!(new.contains("![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)"));
 
-        let new = converter.convert_base64(old, LinkType::Local).await?;
+        let new = converter.to_base64(old, LinkType::Local).await?;
         assert!(new.contains("![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)"));
         assert!(new
             .contains("![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)"));
         assert!(new.contains("![not exist image](test/_not_exists_test.png)"));
         assert!(!new.contains("![test image](test/test.png)"));
 
-        let new = converter.convert_base64(old, LinkType::Net).await?;
+        let new = converter.to_base64(old, LinkType::Net).await?;
         assert!(!new
             .contains("![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)"));
         Ok(())
