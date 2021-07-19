@@ -1,12 +1,13 @@
 use anyhow::{anyhow, Error, Result};
-use futures::{stream, StreamExt};
+use futures::AsyncBufReadExt;
 use once_cell::sync::Lazy;
 use regex::{Captures, Regex};
 use reqwest::Client;
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::fmt::format;
 use std::string::ToString;
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use std::{
     fs::read_to_string,
     path::{Path, PathBuf},
@@ -32,11 +33,10 @@ pub enum LinkError {
     Unreachable(Link),
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Display)]
 pub enum Link {
     Local(PathBuf),
     Net(Url),
-    Unknown(String),
 }
 
 impl FromStr for Link {
@@ -52,13 +52,11 @@ impl FromStr for Link {
         let p = Path::new(&link);
         // check if exists
         if let Err(e) = p.canonicalize() {
-            log::trace!("invalid local path for link: {}, error: {}", link, e);
+            log::debug!("invalid local path for link: {}, error: {}", link, e);
+            Err(anyhow!("link {} is not url or path type", link))
         } else {
-            return Ok(Link::Local(p.to_path_buf()));
+            Ok(Link::Local(p.to_path_buf()))
         }
-
-        log::debug!("unknown link: {}", link);
-        Ok(Link::Unknown(link.to_string()))
     }
 }
 
@@ -105,42 +103,105 @@ impl TryFrom<&[u8]> for ImageFormat {
     }
 }
 
-pub async fn check(context: &str, link_type: LinkType) -> Result<()> {
-    todo!()
+pub struct Converter {
+    client: Client,
 }
 
-pub async fn convert(context: &str, link_type: LinkType) -> Result<String> {
-    // 1. get all links with key caps[0]
+impl Converter {
+    pub fn new() -> Self {
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .build()
+            .expect("client build error");
+        Self { client }
+    }
 
-    // 2. filter by link_type and check link
+    pub async fn convert_base64(&self, text: &str, link_type: LinkType) -> Result<String> {
+        // 1. get all links with key caps[0]
+        let jobs = RE_IMAGE
+            .captures_iter(text)
+            .map(|caps| {
+                (
+                    caps[0].to_string(),
+                    caps.get(2)
+                        .ok_or_else(|| anyhow!("Unable to index 2 in regex: {}", RE_IMAGE.as_str()))
+                        .and_then(|s| s.as_str().parse::<Link>()),
+                )
+            })
+            .filter(|(_, link)| link.is_ok())
+            .map(|(all, link)| (all, link.unwrap()))
+            // 2. filter by link_type and check link
+            .filter(|(_, link)| {
+                matches!(
+                    (link, &link_type),
+                    (Link::Local(_), LinkType::All | LinkType::Local)
+                        | (Link::Net(_), LinkType::All | LinkType::Net)
+                )
+            })
+            .map(|(all, link)| {
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    // log::trace!("checking if link {:?} is available", link);
+                    if let Err(e) = check_link(&client, &link).await {
+                        return Err(anyhow!("found link {} is unavailable: {}", link, e));
+                    }
+                    // 3. load image in parallel
+                    let buf = load_image(&client, &link).await?;
+                    // 4. valid magic numbers
+                    let fmt = match ImageFormat::try_from(&buf[..]) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            log::warn!("the link: `{:?}` is not an image file", link);
+                            return Err(e);
+                        }
+                    };
+                    // to base64 encode bytes
+                    Ok::<(String, String, ImageFormat), Error>((all, base64::encode(buf), fmt))
+                })
+            })
+            .collect::<Vec<_>>();
 
-    // 3. load image and base64 encode in parallel
+        log::trace!("waiting for {} link tasks", jobs.len());
+        let links = futures::future::join_all(jobs)
+            .await
+            .into_iter()
+            .map(|res| res.map_err(Into::into).and_then(|v| v))
+            .filter(|res| {
+                if let Err(e) = res {
+                    log::warn!("a Link task failed: {}", e);
+                    false
+                } else {
+                    true
+                }
+            })
+            .map(Result::unwrap)
+            .map(|(key, b64, fmt)| (key, (b64, fmt)))
+            .collect::<HashMap<String, (String, ImageFormat)>>();
+        log::info!("Complete {} image base64 encoding", links.len());
 
-    // 4. 
-    todo!()
+        // 5. replace links with key val and append base64 to the end
+        Ok(replace(text, &links))
+    }
 }
 
-async fn check_link(link: Link) -> Result<()> {
+async fn check_link(client: &Client, link: &Link) -> Result<()> {
     match link {
         Link::Local(p) => {
             let path_str = p.to_str().ok_or_else(|| anyhow!("to str error"))?;
             if !p.is_file() {
                 return Err(anyhow!("the link `{}` is not a file", path_str));
             }
-
-            if ImageFormat::from_str(
-                p.file_name()
-                    .and_then(|s| s.to_str())
-                    .ok_or_else(|| anyhow!("to str error"))?,
-            )
-            .is_err()
-            {
+            let name = p
+                .extension()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| anyhow!("to str error"))?;
+            if ImageFormat::from_str(name).is_err() {
                 return Err(anyhow!("the link {} is not a image", path_str));
             }
         }
         Link::Net(url) => {
             log::trace!("checking if the url `{}` is available", url);
-            let resp = Client::builder().build()?.head(url.as_str()).send().await?;
+            let resp = client.head(url.as_str()).send().await?;
             if log::log_enabled!(log::Level::Trace) {
                 log::trace!(
                     "got resp for url: {}, status: {}, headers: {:?}",
@@ -165,134 +226,11 @@ async fn check_link(link: Link) -> Result<()> {
                 ));
             }
         }
-        Link::Unknown(s) => {
-            return Err(anyhow!("unknown link: {}", s));
-        }
     }
     Ok(())
 }
 
-fn parse_links(context: &str) -> HashMap<String, Link> {
-    todo!()
-}
-
-pub async fn convert_base64(context: &str, link_type: LinkType) -> Result<String> {
-    // 1. parse link in for regex captures
-    let (context, links) = replace_links(context, link_type);
-
-    // async tasks
-    log::debug!("starting to execute {} link tasks", links.len());
-    let jobs = links
-        .into_iter()
-        .map(|(id, link)| {
-            tokio::spawn(async move {
-                // 2. load image as bytes
-                let buf = load_image(&link).await?;
-                // 3. valid the link is image
-                let fmt = match ImageFormat::try_from(&buf[..]) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        log::warn!("the link: `{:?}` is not an image file", link);
-                        return Err(e);
-                    }
-                };
-                // 4. to base64 encode bytes
-                Ok::<(String, ImageFormat, String), Error>((id, fmt, base64::encode(buf)))
-            })
-        })
-        .collect::<Vec<_>>();
-
-    log::trace!("waiting for {} link tasks", jobs.len());
-    let res = futures::future::join_all(jobs)
-        .await
-        .into_iter()
-        .map(|e| e.map_err(Into::into).and_then(|v| v))
-        .collect::<Vec<Result<(String, ImageFormat, String), Error>>>();
-    if log::log_enabled!(log::Level::Debug) {
-        log::debug!(
-            "{} tasks completed and {} failed",
-            res.len(),
-            res.iter().filter(|r| r.is_err()).count()
-        );
-    }
-
-    // check if has any error
-    if let Some(Err(e)) = res.iter().find(|r| r.is_err()) {
-        return Err(anyhow!("convert base64 failed: {}", e));
-    }
-
-    log::trace!("appending {} links to the end", res.len());
-    let mut context = context;
-    context.push_str(&format!(
-        "\n\n<!-- auto generated by mdutil at {} -->\n\n",
-        humantime::format_rfc3339(SystemTime::now())
-    ));
-    // 5. append link with base64
-    Ok(res.into_iter().fold(context, |mut acc, r| {
-        if let Ok((id, fmt, b64)) = r {
-            acc.push_str(&format!(
-                "[{}]:data:image/{};base64,{}\n",
-                id,
-                fmt.to_string().to_lowercase(),
-                b64
-            ));
-        }
-        acc
-    }))
-}
-
-fn replace_links(context: &str, link_type: LinkType) -> (String, Vec<(String, Link)>) {
-    let mut id_links = vec![];
-    let mut count = 0;
-    let new_context = RE_IMAGE.replace_all(context, |caps: &Captures| {
-        let (original, link_str) = (&caps[0], &caps[2]);
-        match link_str.parse::<Link>() {
-            Ok(link) => {
-                // get replaced id with count and filename
-                let id = match (&link, &link_type) {
-                    (Link::Local(p), LinkType::All | LinkType::Local) => {
-                        p.file_name().and_then(|s| s.to_str())
-                    }
-                    (Link::Net(url), LinkType::All | LinkType::Net) => {
-                        url.path_segments().and_then(|c| c.last())
-                    }
-                    (_, _) => {
-                        log::debug!(
-                            "skip replacing link `{}` due to LinkType: {}",
-                            link_str,
-                            link_type
-                        );
-                        return original.to_string();
-                    }
-                }
-                // `1_file.jpg`
-                .map(|s| format!("{}_{}", count, s))
-                // `1_none`
-                .unwrap_or_else(|| {
-                    log::debug!(
-                        "not found filename in link: {}, replace it with the default name: none",
-                        link_str
-                    );
-                    format!("{}_none", count)
-                });
-
-                // use id to index `![image][name]`
-                let new = format!("![{}][{}]", &caps[1], id);
-                log::debug!("replacing link `{}` with `{}`", original, new);
-                id_links.push((id, link));
-                count += 1;
-                new
-            }
-            Err(e) => {
-                log::warn!("parse link `{}` error: {}", link_str, e);
-                original.to_string()
-            }
-        }
-    });
-    (new_context.into(), id_links)
-}
-
-async fn load_image(link: &Link) -> Result<Vec<u8>> {
+async fn load_image(client: &Client, link: &Link) -> Result<Vec<u8>> {
     match link {
         Link::Local(path) => {
             log::trace!("reading from path: {:?}", path.to_str());
@@ -300,7 +238,7 @@ async fn load_image(link: &Link) -> Result<Vec<u8>> {
         }
         Link::Net(url) => {
             log::trace!("requesting with url: {}", url);
-            let resp = reqwest::get(url.as_str()).await?;
+            let resp = client.get(url.as_str()).send().await?;
             if !resp.status().is_success() {
                 log::warn!(
                     "request failed for url: {}, status: {}, body.text: {}",
@@ -312,8 +250,78 @@ async fn load_image(link: &Link) -> Result<Vec<u8>> {
             }
             resp.bytes().await.map(|b| b.to_vec()).map_err(Into::into)
         }
-        Link::Unknown(s) => Err(anyhow!("unknown link: {}", s)),
     }
+}
+
+pub async fn check(context: &str, link_type: LinkType) -> Result<()> {
+    todo!()
+}
+
+/// 从text中替换所有存在links中的链接为value.base64的硬编码格式值：
+///
+/// - 替换link为：`![alt_text][id]`
+/// - `[id]:data:image/png;base64,__b64code`添加到文件最后
+///
+/// id使用`count_filename`的格式。count为links的数量，filename从link中取，
+/// 如果无法找到filename使用默认值`count_none`
+fn replace(text: &str, links: &HashMap<String, (String, ImageFormat)>) -> String {
+    // count for replacement
+    let mut count = 0;
+    let mut encoded_text = format!(
+        "\n\n<!-- auto generated by mdutil at {} -->\n\n",
+        humantime::format_rfc3339(SystemTime::now())
+    );
+    log::debug!("start using regular substitution links: {}", links.len());
+    let mut new_text = RE_IMAGE
+        .replace_all(text, |caps: &Captures| {
+            let (original, link) = (caps[0].to_string(), &caps[2]);
+            // 1. get key
+            if let Some((b64, fmt)) = links.get(&original) {
+                let id = match link.parse::<Link>() {
+                    Ok(Link::Local(p)) => p
+                        .file_name()
+                        .and_then(|s| s.to_str().map(|s| s.to_string())),
+                    Ok(Link::Net(url)) => url
+                        .path_segments()
+                        .and_then(|items| items.last().map(|s| s.to_string())),
+                    // ignore
+                    _ => return original,
+                }
+                // `0_file.jpg`
+                .map(|s| format!("{}_{}", count, s))
+                // `0_none`
+                .unwrap_or_else(|| {
+                    log::debug!(
+                        "not found filename in link: {}, replace it with the default name: none",
+                        link
+                    );
+                    format!("{}_none", count)
+                });
+
+                // 2. get replaced name, use id to index `![alt text][id]`
+                let new = format!("![{}][{}]", &caps[1], id);
+                log::info!("replacing link `{}` with `{}`", original, new);
+
+                // 3. append to the end
+                encoded_text.push_str(&format!(
+                    "[{}]:data:image/{};base64,{}\n",
+                    id,
+                    fmt.to_string().to_lowercase(),
+                    b64
+                ));
+
+                count += 1;
+                new
+            } else {
+                // Not selected for replacement
+                original
+            }
+        })
+        .to_string();
+
+    // merge to the end
+    new_text += &encoded_text;
+    new_text
 }
 
 #[cfg(test)]
@@ -335,33 +343,60 @@ the test
 
 ![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)"#;
 
+    static CLIENT: Lazy<Client> = Lazy::new(|| Client::builder().build().unwrap());
+
     #[tokio::test]
     async fn convert_image_to_base64() -> Result<()> {
+        let converter = Converter::new();
         let old = DATA;
-        let new = convert_base64(old, LinkType::All).await?;
+        let new = converter.convert_base64(old, LinkType::All).await?;
         assert!(!new.is_empty());
+        assert!(new.len() > old.len());
+        assert!(new.lines().count() > old.lines().count());
         assert!(new.contains("# markdown util"));
         assert!(!new.contains("![test image](test/test.png)"));
 
-        assert!(new.len() > old.len());
-        assert!(new.lines().count() > old.lines().count());
+        assert!(new.contains("![not exist image](test/_not_exists_test.png)"));
+        assert!(new.contains("![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)"));
 
-        let old = format!("{}\n\n![not exist image](test/_not_exists_test.png)", DATA);
-        let res = convert_base64(&old, LinkType::All).await;
-        assert!(res.is_err());
+        let new = converter.convert_base64(old, LinkType::Local).await?;
+        assert!(new.contains("![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)"));
+        assert!(new
+            .contains("![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)"));
+        assert!(new.contains("![not exist image](test/_not_exists_test.png)"));
+        assert!(!new.contains("![test image](test/test.png)"));
 
+        let new = converter.convert_base64(old, LinkType::Net).await?;
+        assert!(!new
+            .contains("![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)"));
         Ok(())
     }
 
-    #[test]
-    fn replace() -> Result<()> {
-        let mut count = 0;
-        let result = RE_IMAGE.replace_all(DATA, |caps: &Captures| {
-            count += 1;
-            format!("![{}][{}]", &caps[1], count)
-        });
+    #[tokio::test]
+    async fn check_links() -> Result<()> {
+        assert!(check_link(
+            &CLIENT,
+            &Link::Net(
+                "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png".parse()?
+            )
+        )
+        .await
+        .is_ok());
+        assert!(check_link(
+            &CLIENT,
+            &Link::Net("https://fsafthe234notexist.com/a/b/c_aaaa/a.png".parse()?)
+        )
+        .await
+        .is_err());
 
-        log::info!("{}", result);
+        assert!(
+            check_link(&CLIENT, &Link::Local("test/_not_exists_test.png".parse()?))
+                .await
+                .is_err()
+        );
+        assert!(check_link(&CLIENT, &Link::Local("test/test.png".parse()?))
+            .await
+            .is_ok());
         Ok(())
     }
 
@@ -375,13 +410,19 @@ the test
     #[tokio::test]
     async fn test_load_image() -> Result<()> {
         let link = "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png";
-        assert!(!load_image(&Link::Net(link.parse()?)).await?.is_empty());
+        assert!(!load_image(&CLIENT, &Link::Net(link.parse()?))
+            .await?
+            .is_empty());
 
         let link = "test/test.png";
-        assert!(!load_image(&Link::Local(link.parse()?)).await?.is_empty());
+        assert!(!load_image(&CLIENT, &Link::Local(link.parse()?))
+            .await?
+            .is_empty());
 
         let link = "_not/exist/_file.png";
-        assert!(load_image(&Link::Local(link.parse()?)).await.is_err());
+        assert!(load_image(&CLIENT, &Link::Local(link.parse()?))
+            .await
+            .is_err());
         Ok(())
     }
 
@@ -399,15 +440,22 @@ the test
     }
 
     #[test]
-    fn test_replace_link() -> Result<()> {
-        let (new, links) = replace_links(DATA, LinkType::All);
-        assert!(!new.is_empty());
+    fn replace_with_links() -> Result<()> {
+        let mut links = HashMap::new();
+        links.insert(
+            "![test image](test/test.png)".to_string(),
+            ("base64testaaabb".to_string(), ImageFormat::Png),
+        );
+        links.insert(
+            "![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)".to_string(),
+            ("base64testaaabbcccccc".to_string(), ImageFormat::Png),
+        );
+        let old = DATA;
+        let new = replace(old, &links);
+        assert!(new.len() > old.len());
         assert!(!new.contains("![test image](test/test.png)"));
-        assert_eq!(links.len(), 3);
-        assert!(links.contains(&("1_test.png".to_string(), "test/test.png".parse::<Link>()?)));
-
-        // let (new, links) = replace_links(DATA, LinkType::All);
-
+        // image id with base64 encoded: `[id]:data:image/png;base64,base64_encode`
+        assert!(new.contains("[1_PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png]:data:image/png;base64,base64testaaabbcccccc"));
         Ok(())
     }
 }
