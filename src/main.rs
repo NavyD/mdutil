@@ -3,6 +3,7 @@ use mdutil::image::{Checker, LinkType};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use structopt::StructOpt;
 
 #[derive(StructOpt, Debug)]
@@ -10,8 +11,8 @@ enum Opt {
     Check {
         #[structopt(flatten)]
         common: Common,
-        #[structopt(long, parse(try_from_str), default_value = "All")]
-        image_link_type: LinkType,
+        #[structopt(flatten)]
+        args: CheckerArgs,
     },
 }
 
@@ -20,10 +21,24 @@ impl Opt {
         match self {
             Opt::Check {
                 common,
-                image_link_type: _,
+                args: _,
             } => common,
         }
     }
+}
+
+#[derive(Clone, Debug, StructOpt)]
+pub struct CheckerArgs {
+    #[structopt(long, parse(try_from_str = parse_duration_secs), default_value = "5")]
+    pub connect_timeout: Duration,
+    #[structopt(long, parse(try_from_str), default_value = "local")]
+    pub image_link_type: LinkType,
+}
+
+fn parse_duration_secs(s: &str) -> Result<Duration> {
+    s.parse::<u64>()
+        .map(|v| Duration::from_secs(v))
+        .map_err(Into::into)
 }
 
 #[derive(StructOpt, Debug, Default, Clone)]
@@ -51,7 +66,8 @@ fn parse_extensions(s: &str) -> HashSet<String> {
         .collect::<HashSet<String>>()
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
+// #[tokio::main]
 async fn main() -> Result<()> {
     let opt = Opt::from_args();
     init_log(opt.common().verbose)?;
@@ -62,12 +78,12 @@ async fn main() -> Result<()> {
         return Err(anyhow!("empty markdown paths"));
     }
 
-    let checker = Checker::new();
     match opt {
         Opt::Check {
             common: _,
-            image_link_type,
+            args,
         } => {
+            let checker = Checker::new(args);
             do_check(&paths, &checker, image_link_type).await;
         }
     }
@@ -109,9 +125,8 @@ async fn do_check(paths: &[PathBuf], checker: &Checker, image_link_type: LinkTyp
             })
         })
         .collect::<Vec<_>>();
-    log::info!("waiting tasks {}", tasks.len());
-    futures::future::join_all(tasks).await;
-    log::info!("check task completed");
+    let tasks = futures::future::join_all(tasks).await;
+    println!("check tasks {} completed", tasks.len());
 }
 
 fn init_log(verbose: u8) -> Result<()> {
