@@ -1,11 +1,8 @@
-use anyhow::{anyhow, Result};
-use mdutil::image::{self, Converter, LinkType};
+use anyhow::{anyhow, Error, Result};
+use mdutil::image::{Checker, LinkType};
 use std::collections::HashSet;
 use std::fs;
-use std::{
-    convert::TryFrom,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 use structopt::StructOpt;
 
 #[derive(StructOpt, Debug)]
@@ -25,9 +22,6 @@ impl Opt {
                 common,
                 image_link_type: _,
             } => common,
-            _ => {
-                panic!()
-            }
         }
     }
 }
@@ -68,18 +62,56 @@ async fn main() -> Result<()> {
         return Err(anyhow!("empty markdown paths"));
     }
 
+    let checker = Checker::new();
     match opt {
         Opt::Check {
             common: _,
             image_link_type,
         } => {
-            let con = Converter::new();
-            for p in &paths {
-                con.check(p, image_link_type).await?
-            }
+            do_check(&paths, &checker, image_link_type).await;
         }
     }
     Ok(())
+}
+
+async fn do_check(paths: &[PathBuf], checker: &Checker, image_link_type: LinkType) {
+    let tasks = paths
+        .iter()
+        .map(|path| {
+            let checker = checker.clone();
+            let path = path.to_owned();
+            tokio::spawn(async move {
+                let infos = checker.check(&path, image_link_type).await?;
+                let err_infos = infos
+                    .iter()
+                    .filter(|info| info.error.is_some())
+                    .collect::<Vec<_>>();
+                if err_infos.is_empty() {
+                    return Ok(());
+                }
+                let text = format!(
+                    "`{}` has {} problems:\n",
+                    path.canonicalize()?.to_str().unwrap(),
+                    err_infos.len()
+                );
+                let err_text = err_infos.iter().fold(text, |mut acc, info| {
+                    acc += &format!(
+                        "row: {}, link: {}, error: {}, line: {}\n",
+                        info.row_num,
+                        info.link,
+                        info.error.as_ref().unwrap(),
+                        info.line
+                    );
+                    acc
+                });
+                println!("{}", err_text);
+                Ok::<_, Error>(())
+            })
+        })
+        .collect::<Vec<_>>();
+    log::info!("waiting tasks {}", tasks.len());
+    futures::future::join_all(tasks).await;
+    log::info!("check task completed");
 }
 
 fn init_log(verbose: u8) -> Result<()> {
@@ -179,16 +211,6 @@ mod tests {
         },
         ..Default::default()
     });
-
-    #[test]
-    fn test_check() -> Result<()> {
-        let opt = Opt::Check {
-            image_link_type: LinkType::All,
-            common: COM.clone(),
-        };
-
-        Ok(())
-    }
 
     #[test]
     fn test_load_input_paths() -> Result<()> {

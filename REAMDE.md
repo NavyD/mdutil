@@ -13,11 +13,7 @@
 mdutil c --image-to-base64=local|net|all --net-image-to-ref --recursive --tag- --output=./md_utiled .
 ```
 
-![test image](tests/resources/test.png)
-
 ## 如何验证文件是合法的image文件
 
 - [Validate image from file in C#](https://stackoverflow.com/questions/210650/validate-image-from-file-in-c-sharp/9446045#9446045)
 - [How to check if a file is a valid image file?](https://stackoverflow.com/a/902779)
-
-

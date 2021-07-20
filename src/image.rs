@@ -1,20 +1,24 @@
+use anyhow::{anyhow, Error, Result};
+use log::*;
+use once_cell::sync::Lazy;
+use regex::{Captures, Regex};
+use reqwest::Client;
 use std::collections::HashMap;
+use std::convert::AsRef;
 use std::convert::TryFrom;
-use std::fmt::format;
+use std::fmt::Display;
+use std::fs::File;
+use std::io::Read;
 use std::string::ToString;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use std::{
     fs::read_to_string,
     path::{Path, PathBuf},
     str::FromStr,
 };
-
-use anyhow::{anyhow, Error, Result};
-use futures::AsyncBufReadExt;
-use once_cell::sync::Lazy;
-use regex::{Captures, Regex};
-use reqwest::Client;
+use strum_macros::AsRefStr;
 use strum_macros::{Display, EnumString};
+use thiserror::Error;
 use tokio::fs as afs;
 use url::Url;
 
@@ -22,22 +26,63 @@ static RE_IMAGE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"!\[(.*)\]\((.+)\)").expect("regex init failed for image"));
 
 #[derive(Debug, PartialEq, Eq, Display, EnumString, Clone, Copy)]
+#[strum(ascii_case_insensitive)]
 pub enum LinkType {
     Local,
     Net,
     All,
 }
 
-pub enum LinkError {
-    NotFound(Link),
-    NotImage(Link),
-    Unreachable(Link),
+#[derive(Debug, Error)]
+pub enum LinkCheckError {
+    #[error("The link was not found because path does not exist or url is not available")]
+    NotFound,
+    #[error("path or url is not image file: {0}")]
+    NotImageFile(String),
+    #[error("unsupported image extension: {0}")]
+    UnsupportedExtension(String),
+    #[error("invalid image magic numbers: {0:?}")]
+    InvalidImageMagicNumber([u8; 4]),
+
+    #[error("request head failed, status: {0}, headers: {1}")]
+    HeadFailed(u16, String),
+    #[error("")]
+    FailedResponse(u16, String),
+    #[error("unknown error: {0}")]
+    Unknown(String),
+    #[error("error: {0}")]
+    Other(Error),
 }
 
-#[derive(Debug, PartialEq, Eq, Display)]
+#[derive(Debug)]
+pub struct CheckInfo {
+    pub path: String,
+    pub image_link: String,
+    pub link: Link,
+    pub line: String,
+    pub row_num: usize,
+    pub col_num: usize,
+    pub error: Option<LinkCheckError>,
+}
+
+#[derive(Debug, PartialEq, Eq, AsRefStr)]
 pub enum Link {
     Local(PathBuf),
     Net(Url),
+}
+
+impl Display for Link {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}({})",
+            self.as_ref(),
+            match self {
+                Link::Local(p) => p.to_str().unwrap_or("none"),
+                Link::Net(u) => u.as_str(),
+            }
+        )
+    }
 }
 
 impl FromStr for Link {
@@ -55,16 +100,12 @@ impl FromStr for Link {
 }
 
 #[derive(Debug, PartialEq, Eq, Display, EnumString)]
+#[strum(ascii_case_insensitive)]
 enum ImageFormat {
-    #[strum(ascii_case_insensitive)]
     Bmp,
-    #[strum(ascii_case_insensitive)]
     Jpeg,
-    #[strum(ascii_case_insensitive)]
     Gif,
-    #[strum(ascii_case_insensitive)]
     Tiff,
-    #[strum(ascii_case_insensitive)]
     Png,
 }
 
@@ -97,20 +138,21 @@ impl TryFrom<&[u8]> for ImageFormat {
     }
 }
 
-pub struct Converter {
+#[derive(Clone)]
+pub struct Checker {
     client: Client,
 }
 
-impl Converter {
+impl Checker {
     pub fn new() -> Self {
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .expect("client build error");
         Self { client }
     }
 
-    pub async fn to_base64(&self, text: &str, link_type: LinkType) -> Result<String> {
+    pub async fn embed_base64(&self, text: &str, link_type: LinkType) -> Result<String> {
         // 1. get all links with key caps[0]
         let jobs = RE_IMAGE
             .captures_iter(text)
@@ -137,7 +179,11 @@ impl Converter {
                 tokio::spawn(async move {
                     // log::trace!("checking if link {:?} is available", link);
                     if let Err(e) = check_link(&client, &link).await {
-                        return Err(anyhow!("found link {} is unavailable: {}", link, e));
+                        return Err(anyhow!(
+                            "found link {} is unavailable: {}",
+                            link.to_string(),
+                            e
+                        ));
                     }
                     // 3. load image in parallel
                     let buf = load_image(&client, &link).await?;
@@ -177,89 +223,155 @@ impl Converter {
         Ok(replace(text, &links))
     }
 
-    pub async fn check(&self, path: impl AsRef<Path>, link_type: LinkType) -> Result<()> {
-        log::trace!(
-            "checking with path: {:?}, link type: {}",
-            path.as_ref(),
-            link_type
-        );
-        let jobs = RE_IMAGE
-            .captures_iter(&read_to_string(&path)?)
-            .map(|caps| {
-                (
-                    caps[0].to_string(),
-                    caps.get(2)
-                        .ok_or_else(|| anyhow!("Unable to index 2 in regex: {}", RE_IMAGE.as_str()))
-                        .and_then(|s| s.as_str().parse::<Link>()),
-                )
-            })
-            .filter(|(_, link)| link.is_ok())
-            .map(|(all, link)| (all, link.unwrap()))
-            .map(|(all, link)| {
-                if let Link::Local(p) = &link {
-                    if p.is_relative() {
-                        let new_path = path.as_ref().parent().unwrap().join(p);
-                        log::info!("new path: {}", new_path.to_str().unwrap());
-                        return (all, Link::Local(new_path));
-                    }
-                }
-                (all, link)
-            })
-            // 2. filter by link_type and check link
-            .filter(|(_, link)| {
-                matches!(
-                    (link, &link_type),
+    pub async fn check(
+        &self,
+        path: impl AsRef<Path>,
+        link_type: LinkType,
+    ) -> Result<Vec<CheckInfo>> {
+        let path = path.as_ref();
+        // line mode
+        let text = read_to_string(path)?;
+        let mut tasks = vec![];
+        for (row, line) in text.lines().enumerate() {
+            for caps in RE_IMAGE.captures_iter(line) {
+                // caps[2] is link for RE_IMAGE
+                let link = parse_link(path, &caps[2])?;
+                // filter by link type
+                if !matches!(
+                    (&link, &link_type),
                     (Link::Local(_), LinkType::All | LinkType::Local)
                         | (Link::Net(_), LinkType::All | LinkType::Net)
-                )
-            })
-            .map(|(all, link)| {
-                let client = self.client.clone();
-                tokio::spawn(async move {
-                    // log::trace!("checking if link {:?} is available", link);
-                    if let Err(e) = check_link(&client, &link).await {
-                        Err(anyhow!("found link {} is unavailable: {}", link, e))
-                    } else {
-                        Ok(all)
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
+                ) {
+                    trace!(
+                        "skip a link {} for link type: {}",
+                        link.to_string(),
+                        link_type
+                    );
+                    continue;
+                }
 
-        futures::future::join_all(jobs)
+                // async check
+                let client = self.client.clone();
+                let (line, image_link, path) = (
+                    line.to_string(),
+                    caps[0].to_string(),
+                    path.to_str().unwrap_or("").to_string(),
+                );
+                let handle = tokio::spawn(async move {
+                    let error = check_link(&client, &link)
+                        .await
+                        .map_or_else(Some, |_| None::<LinkCheckError>);
+                    CheckInfo {
+                        error,
+                        line,
+                        link,
+                        path,
+                        col_num: 0,
+                        row_num: row + 1,
+                        image_link,
+                    }
+                });
+                tasks.push(handle);
+            }
+        }
+        debug!("waiting {} tasks on path: {:?}", tasks.len(), path);
+        let infos = futures::future::join_all(tasks)
             .await
             .into_iter()
-            .map(|res| res.map_err(Into::into).and_then(|v| v))
-            .for_each(|res| match res {
-                Ok(link) => {
-                    println!("available link: {}", link);
+            .filter(|info| {
+                if let Err(e) = info {
+                    log::error!("async task failed: {} in path: {:?}", e, path);
+                    false
+                } else {
+                    true
                 }
-                Err(e) => {
-                    eprintln!("unavailable: {}", e);
-                }
-            });
-        Ok(())
+            })
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+
+        if log_enabled!(Level::Info) {
+            info!(
+                "there are {} problems in the check path: {:?}",
+                infos.iter().filter(|info| info.error.is_some()).count(),
+                path
+            );
+        }
+        Ok(infos)
     }
 }
 
-async fn check_link(client: &Client, link: &Link) -> Result<()> {
+/// 联合md文件path与link解析出Link。如果link是一个本地相对path，使用
+/// 文件path组合为可用的path。不会验证link的可用性
+fn parse_link(path: impl AsRef<Path>, link: &str) -> Result<Link> {
+    let path = path.as_ref();
+    match link.parse::<Url>() {
+        Ok(url) => return Ok(Link::Net(url)),
+        Err(e) => trace!("invalid url for link: {}, error: {}", link, e),
+    };
+    let link_path = Path::new(link);
+    // get new link path
+    let link_path = if link_path.is_relative() {
+        // tests/resources/test.md : link=./test.png => tests/resources/test.png
+        path.parent()
+            .map(|parent| parent.join(link_path))
+            .ok_or_else(|| {
+                anyhow!(
+                    "join failed: parent {:?}, sub {:?}",
+                    path.parent(),
+                    link_path
+                )
+            })?
+    } else {
+        link_path.to_path_buf()
+    };
+    Ok(Link::Local(link_path))
+}
+
+async fn check_link(client: &Client, link: &Link) -> Result<(), LinkCheckError> {
+    trace!("checking link: {}", link.to_string());
     match link {
         Link::Local(p) => {
-            let path_str = p.to_str().ok_or_else(|| anyhow!("to str error"))?;
+            let path_str = p
+                .to_str()
+                .ok_or_else(|| LinkCheckError::Unknown(format!("to str error: {:?}", p)))?;
+            // check if image is file
             if !p.is_file() {
-                return Err(anyhow!("the link `{}` is not a file", path_str));
+                return Err(LinkCheckError::NotImageFile(format!(
+                    "{} does not exist or is not a file",
+                    path_str
+                )));
             }
-            let name = p
-                .extension()
+            // check extension
+            p.extension()
                 .and_then(|s| s.to_str())
-                .ok_or_else(|| anyhow!("to str error"))?;
-            if ImageFormat::from_str(name).is_err() {
-                return Err(anyhow!("the link {} is not a image", path_str));
-            }
+                .ok_or_else(|| LinkCheckError::Unknown(format!("to str error: {:?}", p)))
+                .and_then(|name| {
+                    ImageFormat::from_str(name).map_err(|e| {
+                        LinkCheckError::UnsupportedExtension(format!(
+                            "path: {:?}, extension: {}, error: {}",
+                            p, name, e
+                        ))
+                    })
+                })?;
+            // check magic
+            let mut buf = [0; 4];
+            File::open(p)
+                .map_err(|e| LinkCheckError::Unknown(format!("{}", e)))
+                .and_then(|mut f| {
+                    f.read(&mut buf)
+                        .map_err(|e| LinkCheckError::Other(e.into()))
+                })?;
+            ImageFormat::try_from(&buf[..]).map_err(|e| {
+                log::error!("parse image format error: {}, magic num: {:?}", e, buf);
+                LinkCheckError::InvalidImageMagicNumber(buf)
+            })?;
         }
         Link::Net(url) => {
-            log::trace!("checking if the url `{}` is available", url);
-            let resp = client.head(url.as_str()).send().await?;
+            let resp = client
+                .head(url.as_str())
+                .send()
+                .await
+                .map_err(|e| LinkCheckError::Other(e.into()))?;
             if log::log_enabled!(log::Level::Trace) {
                 log::trace!(
                     "got resp for url: {}, status: {}, headers: {:?}",
@@ -268,19 +380,24 @@ async fn check_link(client: &Client, link: &Link) -> Result<()> {
                     resp.headers().iter().collect::<Vec<_>>()
                 );
             }
-
             if !resp.status().is_success()
-                || resp
+                || !resp
                     .headers()
                     .get("Content-Type")
-                    .and_then(|val| val.to_str().map(|s| !s.contains("image")).ok())
+                    // only check image[/fmt]
+                    .and_then(|val| val.to_str().map(|s| s.contains("image")).ok())
                     .unwrap_or(false)
             {
-                return Err(anyhow!(
+                let headers = resp.headers().iter().collect::<Vec<_>>();
+                log::debug!(
                     "unavailable url: {}, resp status: {}, headers: {:?}",
                     url,
                     resp.status(),
-                    resp.headers().iter().collect::<Vec<_>>()
+                    headers
+                );
+                return Err(LinkCheckError::HeadFailed(
+                    resp.status().as_u16(),
+                    format!("{:?}", headers),
                 ));
             }
         }
@@ -309,10 +426,6 @@ async fn load_image(client: &Client, link: &Link) -> Result<Vec<u8>> {
             resp.bytes().await.map(|b| b.to_vec()).map_err(Into::into)
         }
     }
-}
-
-pub async fn check(context: &str, link_type: LinkType) -> Result<()> {
-    todo!()
 }
 
 /// 从text中替换所有存在links中的链接为value.base64的硬编码格式值：
@@ -403,21 +516,25 @@ the test
 
     static CLIENT: Lazy<Client> = Lazy::new(|| Client::builder().build().unwrap());
 
+    static DATA_DIR: Lazy<PathBuf> = Lazy::new(|| "tests/resources".parse().unwrap());
+
     #[tokio::test]
     async fn test_check() -> Result<()> {
-        let converter = Converter::new();
-        // converter.check(DATA, LinkType::All).await?;
+        let checker = Checker::new();
+        let mut path = DATA_DIR.clone();
+        path.push("test.md");
 
-        converter.check("/home/navyd/Workspaces/projects/blog-resources/java/source-code/datastructure/HashMap.md", LinkType::All).await?;
-
+        let infos = checker.check(path, LinkType::All).await?;
+        assert_eq!(infos.len(), 5);
+        assert_eq!(infos.iter().filter(|info| info.error.is_some()).count(), 2);
         Ok(())
     }
 
     #[tokio::test]
     async fn convert_image_to_base64() -> Result<()> {
-        let converter = Converter::new();
+        let converter = Checker::new();
         let old = DATA;
-        let new = converter.to_base64(old, LinkType::All).await?;
+        let new = converter.embed_base64(old, LinkType::All).await?;
         assert!(!new.is_empty());
         assert!(new.len() > old.len());
         assert!(new.lines().count() > old.lines().count());
@@ -427,26 +544,26 @@ the test
         assert!(new.contains("![not exist image](test/_not_exists_test.png)"));
         assert!(new.contains("![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)"));
 
-        let new = converter.to_base64(old, LinkType::Local).await?;
+        let new = converter.embed_base64(old, LinkType::Local).await?;
         assert!(new.contains("![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)"));
         assert!(new
             .contains("![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)"));
         assert!(new.contains("![not exist image](test/_not_exists_test.png)"));
         assert!(!new.contains("![test image](test/test.png)"));
 
-        let new = converter.to_base64(old, LinkType::Net).await?;
+        let new = converter.embed_base64(old, LinkType::Net).await?;
         assert!(!new
             .contains("![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn check_links() -> Result<()> {
+    async fn test_check_links() -> Result<()> {
         assert!(check_link(
             &CLIENT,
             &Link::Net(
                 "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png".parse()?
-            )
+            ),
         )
         .await
         .is_ok());
@@ -457,21 +574,28 @@ the test
         .await
         .is_err());
 
-        assert!(
-            check_link(&CLIENT, &Link::Local("test/_not_exists_test.png".parse()?))
-                .await
-                .is_err()
-        );
-        assert!(check_link(&CLIENT, &Link::Local("test/test.png".parse()?))
-            .await
-            .is_ok());
+        assert!(check_link(
+            &CLIENT,
+            &Link::Local(format!("{}/_not_exists_test.png", DATA_DIR.to_str().unwrap()).parse()?)
+        )
+        .await
+        .is_err());
+        assert!(check_link(
+            &CLIENT,
+            &Link::Local(format!("{}/test.png", DATA_DIR.to_str().unwrap()).parse()?)
+        )
+        .await
+        .is_ok());
         Ok(())
     }
 
     #[test]
     fn valid_image_format() -> Result<()> {
-        let buf = std::fs::read("test/test.png")?;
+        let buf = std::fs::read(format!("{}/test.png", DATA_DIR.to_str().unwrap()))?;
         assert_eq!(ImageFormat::Png, ImageFormat::try_from(&buf[..])?);
+
+        let buf = std::fs::read(format!("{}/test.md", DATA_DIR.to_str().unwrap()))?;
+        assert!(ImageFormat::try_from(&buf[..]).is_err());
         Ok(())
     }
 
@@ -482,12 +606,12 @@ the test
             .await?
             .is_empty());
 
-        let link = "test/test.png";
+        let link = format!("{}/test.png", DATA_DIR.to_str().unwrap());
         assert!(!load_image(&CLIENT, &Link::Local(link.parse()?))
             .await?
             .is_empty());
 
-        let link = "_not/exist/_file.png";
+        let link = format!("{}/_not/exist/_file.png", DATA_DIR.to_str().unwrap());
         assert!(load_image(&CLIENT, &Link::Local(link.parse()?))
             .await
             .is_err());
@@ -495,15 +619,53 @@ the test
     }
 
     #[test]
-    fn parse_link() -> Result<()> {
-        let link = "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png";
-        assert_eq!(link.parse::<Link>()?, Link::Net(link.parse()?));
+    fn test_parse_link() -> Result<()> {
+        let mut md_path = DATA_DIR.to_path_buf();
+        md_path.push("test.md");
 
-        let link = "test/test.png";
-        assert_eq!(link.parse::<Link>()?, Link::Local(PathBuf::from(link)));
+        let link = "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png";
+        assert_eq!(parse_link(&md_path, link)?, Link::Net(link.parse()?));
+
+        let link = "test.png";
+        assert_eq!(
+            parse_link(&md_path, link)?,
+            Link::Local(
+                format!(
+                    "{}/{}",
+                    md_path.parent().and_then(|s| s.to_str()).unwrap(),
+                    link
+                )
+                .parse()?
+            )
+        );
 
         let link = "_not/exist/_file.png";
-        assert!(link.parse::<Link>().is_err());
+        assert_eq!(
+            parse_link(&md_path, link)?,
+            Link::Local(
+                format!(
+                    "{}/{}",
+                    md_path.parent().and_then(|s| s.to_str()).unwrap(),
+                    link
+                )
+                .parse()?
+            )
+        );
+
+        // 不验证path
+        let link = "_not/exis.fsdfsdf.sdfdsf./sdfds.fdsfs";
+        md_path.push("noexist_dir");
+        assert_eq!(
+            parse_link(&md_path, link)?,
+            Link::Local(
+                format!(
+                    "{}/{}",
+                    md_path.parent().and_then(|s| s.to_str()).unwrap(),
+                    link
+                )
+                .parse()?
+            )
+        );
         Ok(())
     }
 
