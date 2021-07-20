@@ -21,7 +21,7 @@ use url::Url;
 static RE_IMAGE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"!\[(.*)\]\((.+)\)").expect("regex init failed for image"));
 
-#[derive(Debug, PartialEq, Eq, Display)]
+#[derive(Debug, PartialEq, Eq, Display, EnumString, Clone, Copy)]
 pub enum LinkType {
     Local,
     Net,
@@ -99,7 +99,6 @@ impl TryFrom<&[u8]> for ImageFormat {
 
 pub struct Converter {
     client: Client,
-    base_path: PathBuf,
 }
 
 impl Converter {
@@ -108,7 +107,7 @@ impl Converter {
             .connect_timeout(Duration::from_secs(2))
             .build()
             .expect("client build error");
-        Self { client,  base_path: std::env::current_dir().unwrap()}
+        Self { client }
     }
 
     pub async fn to_base64(&self, text: &str, link_type: LinkType) -> Result<String> {
@@ -179,6 +178,11 @@ impl Converter {
     }
 
     pub async fn check(&self, path: impl AsRef<Path>, link_type: LinkType) -> Result<()> {
+        log::trace!(
+            "checking with path: {:?}, link type: {}",
+            path.as_ref(),
+            link_type
+        );
         let jobs = RE_IMAGE
             .captures_iter(&read_to_string(&path)?)
             .map(|caps| {
@@ -226,14 +230,12 @@ impl Converter {
             .await
             .into_iter()
             .map(|res| res.map_err(Into::into).and_then(|v| v))
-            .for_each(|res| {
-                match res {
-                    Ok(link) => {
-                        println!("available link: {}", link);
-                    },
-                    Err(e) => {
-                        eprintln!("unavailable: {}", e);
-                    }
+            .for_each(|res| match res {
+                Ok(link) => {
+                    println!("available link: {}", link);
+                }
+                Err(e) => {
+                    eprintln!("unavailable: {}", e);
                 }
             });
         Ok(())

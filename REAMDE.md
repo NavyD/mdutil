@@ -13,7 +13,7 @@
 mdutil c --image-to-base64=local|net|all --net-image-to-ref --recursive --tag- --output=./md_utiled .
 ```
 
-![test image](test/test.png)
+![test image](tests/resources/test.png)
 
 ## 如何验证文件是合法的image文件
 
