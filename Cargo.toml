@@ -22,9 +22,11 @@ tokio = { version = "1.8", features = [
 ] }
 env_logger = "0.9"
 reqwest = { version = "0.11" }
-ctor = "0.1"
 strum_macros = "0.21"
 strum = "0.21"
 humantime = "2.1"
 structopt = "0.3"
 thiserror = "1.0"
+
+[dev-dependencies]
+ctor = "0.1"

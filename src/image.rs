@@ -1,4 +1,7 @@
+use crate::cmd::CheckerArgs;
 use anyhow::{anyhow, Error, Result};
+use futures::future;
+use futures::TryFutureExt;
 use log::*;
 use once_cell::sync::Lazy;
 use regex::{Captures, Regex};
@@ -10,7 +13,7 @@ use std::fmt::Display;
 use std::fs::File;
 use std::io::Read;
 use std::string::ToString;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 use std::{
     fs::read_to_string,
     path::{Path, PathBuf},
@@ -32,6 +35,7 @@ pub enum LinkType {
     Local,
     Net,
     All,
+    None,
 }
 
 #[derive(Debug, Error)]
@@ -66,7 +70,7 @@ pub struct CheckInfo {
     pub error: Option<LinkCheckError>,
 }
 
-#[derive(Debug, PartialEq, Eq, AsRefStr)]
+#[derive(Debug, PartialEq, Eq, AsRefStr, Clone)]
 pub enum Link {
     Local(PathBuf),
     Net(Url),
@@ -83,20 +87,6 @@ impl Display for Link {
                 Link::Net(u) => u.as_str(),
             }
         )
-    }
-}
-
-impl FromStr for Link {
-    type Err = Error;
-
-    /// 解析字符串到Link。如果是一个Url类型或是一个path类型
-    fn from_str(link: &str) -> Result<Self, Self::Err> {
-        match link.parse::<Url>() {
-            Ok(url) => return Ok(Link::Net(url)),
-            Err(e) => log::trace!("invalid url for link: {}, error: {}", link, e),
-        };
-
-        Ok(Link::Local(Path::new(&link).to_path_buf()))
     }
 }
 
@@ -154,93 +144,107 @@ impl Checker {
         Self { client, args }
     }
 
-    /// 解析path中markdown文件中的link替换为内嵌的base64链接
-    pub async fn embed_base64(&self, path: impl AsRef<Path>) -> Result<String> {
+    /// 解析path中markdown文件中的link替换为内嵌的base64链接并返回
+    /// 替换失败的link与error信息。
+    ///
+    /// # Errors
+    ///
+    /// - 如果path不是一个可读文件
+    pub async fn embed_base64(&self, path: impl AsRef<Path>) -> Result<(String, Vec<Error>)> {
         let path = path.as_ref();
-        let path_str = path.to_str().ok_or_else(|| anyhow!("unlink"))?;
+        let path_str = path
+            .to_str()
+            .ok_or_else(|| anyhow!("to str error: {:?}", path))?;
+        debug!("embedding base64 for {}, args: {:?}", path_str, self.args);
         let text = read_to_string(path)?;
-        // 1. get all links with key caps[0]
+        let link_type = self.args.image_link_type;
+
         let jobs = RE_IMAGE
             .captures_iter(&text)
             .map(|caps| (caps[0].to_string(), parse_link(path, &caps[2])))
-            .filter(|(all, link)| {
-                // filter unlink
-                if let Err(e) = link {
-                    debug!("skip the link `{}` that failed to parse: {}", all, e);
-                    false
+            .filter(|(_, link)| {
+                if matches!(
+                    (&link, link_type),
+                    (Link::Local(_), LinkType::All | LinkType::Local)
+                        | (Link::Net(_), LinkType::All | LinkType::Net)
+                ) {
+                    true
                 } else {
-                    // 2. filter by link_type and check link
-                    matches!(
-                        (link.as_ref().unwrap(), self.args.link_type),
-                        (Link::Local(_), LinkType::All | LinkType::Local)
-                            | (Link::Net(_), LinkType::All | LinkType::Net)
-                    )
+                    trace!("skip a link {} for link type: {}", link, link_type);
+                    false
                 }
             })
-            .map(|(all, link)| (all, link.unwrap()))
             .map(|(all, link)| {
-                trace!("start loading Link {} coding task", link);
                 let client = self.client.clone();
                 tokio::spawn(async move {
-                    // log::trace!("checking if link {:?} is available", link);
-                    if let Err(e) = check_link(&client, &link).await {
-                        return Err(anyhow!(
-                            "found link {} is unavailable: {}",
-                            link.to_string(),
-                            e
-                        ));
-                    }
-                    // 3. load image in parallel
-                    let buf = load_image(&client, &link).await?;
-                    // 4. valid magic numbers
-                    let fmt = match ImageFormat::try_from(&buf[..]) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            debug!("the link: `{:?}` is not an image file: {}", link, e);
-                            return Err(e);
-                        }
-                    };
-                    // to base64 encode bytes
-                    Ok::<(String, String, ImageFormat), Error>((all, base64::encode(buf), fmt))
+                    trace!("start loading Link {} coding task", link);
+                    check_link(&client, &link)
+                        .map_err(Into::into)
+                        .and_then(|_| load_image(&client, &link))
+                        .and_then(|buf| async move {
+                            ImageFormat::try_from(&buf[..])
+                                // to base64 encode bytes
+                                .map(|fmt| (all, base64::encode(buf), fmt))
+                        })
+                        // get the context value: if let Ok(link) = e.downcast::<Link>()
+                        .map_err(|e: Error| e.context(link.clone()))
+                        .await
                 })
             })
             .collect::<Vec<_>>();
 
-        trace!(
-            "waiting for {} link tasks in path: {}",
-            jobs.len(),
+        let jobs_size = jobs.len();
+        trace!("waiting for {} link tasks in path: {}", jobs_size, path_str);
+
+        let mut err_links = vec![];
+        let mut links = HashMap::new();
+        for job in future::join_all(jobs).await {
+            let res: Result<(String, String, ImageFormat)> = match job {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("{} has async job error: {}", path_str, e);
+                    continue;
+                }
+            };
+            match res {
+                Ok((all, b64, fmt)) => {
+                    links.insert(all, (b64, fmt));
+                }
+                Err(e) => {
+                    debug!(
+                        "link {} task failed in {}: {}",
+                        e.downcast_ref::<Link>()
+                            .map(Link::to_string)
+                            .unwrap_or_else(|| "none".to_string()),
+                        path_str,
+                        e
+                    );
+                    err_links.push(e);
+                }
+            };
+        }
+
+        info!(
+            "there are {} tasks and {} failed for {}",
+            jobs_size,
+            err_links.len(),
             path_str
         );
-        let links = futures::future::join_all(jobs)
-            .await
-            .into_iter()
-            .map(|res| res.map_err(Into::into).and_then(|v| v))
-            .filter(|res| {
-                if let Err(e) = res {
-                    log::info!("skipping {} by failed link task: {}", path_str, e);
-                    false
-                } else {
-                    true
-                }
-            })
-            .map(Result::unwrap)
-            .map(|(key, b64, fmt)| (key, (b64, fmt)))
-            .collect::<HashMap<String, (String, ImageFormat)>>();
-
-        // 5. replace links with key val and append base64 to the end
-        Ok(replace(&text, &links))
+        debug!("replacing {} links for {}", links.len(), path_str);
+        Ok((replace(&text, &links), err_links))
     }
 
     pub async fn check(&self, path: impl AsRef<Path>) -> Result<Vec<CheckInfo>> {
         let path = path.as_ref();
+        debug!("checking in path: {:?}, args: {:?}", path, self.args);
         // line mode
         let text = read_to_string(path)?;
-        let link_type = self.args.link_type;
+        let link_type = self.args.image_link_type;
         let mut tasks = vec![];
         for (row, line) in text.lines().enumerate() {
             for caps in RE_IMAGE.captures_iter(line) {
                 // caps[2] is link for RE_IMAGE
-                let link = parse_link(path, &caps[2])?;
+                let link = parse_link(path, &caps[2]);
                 // filter by link type
                 if !matches!(
                     (&link, &link_type),
@@ -285,7 +289,7 @@ impl Checker {
             .into_iter()
             .filter(|info| {
                 if let Err(e) = info {
-                    log::error!("async task failed: {} in path: {:?}", e, path);
+                    error!("async task failed: {} in path: {:?}", e, path);
                     false
                 } else {
                     true
@@ -294,8 +298,8 @@ impl Checker {
             .map(Result::unwrap)
             .collect::<Vec<_>>();
 
-        if log_enabled!(Level::Info) {
-            info!(
+        if log_enabled!(Level::Debug) {
+            debug!(
                 "there are {} problems in the check path: {:?}",
                 infos.iter().filter(|info| info.error.is_some()).count(),
                 path
@@ -307,31 +311,42 @@ impl Checker {
 
 /// 联合md文件path与link解析出Link。如果link是一个本地相对path，使用
 /// 文件path组合为可用的path。不会验证link的可用性
-fn parse_link(path: impl AsRef<Path>, link: &str) -> Result<Link> {
+///
+/// `path:tests/resources/test.md, link=./test.png => tests/resources/test.png`
+///
+/// # panics
+///
+/// 当本地path不存在parent目录时。如`path=/`
+fn parse_link(path: impl AsRef<Path>, link: &str) -> Link {
     let path = path.as_ref();
-    match link.parse::<Url>() {
-        Ok(url) => return Ok(Link::Net(url)),
-        Err(e) => trace!("invalid url for link: {}, error: {}", link, e),
-    };
+    trace!("parsing link for path: {:?}, original link: {}", path, link);
+    if let Ok(url) = link.parse::<Url>() {
+        return Link::Net(url);
+    }
     let link_path = Path::new(link);
     // get new link path
     let link_path = if link_path.is_relative() {
         // tests/resources/test.md : link=./test.png => tests/resources/test.png
         path.parent()
             .map(|parent| parent.join(link_path))
-            .ok_or_else(|| {
-                anyhow!(
-                    "join failed: parent {:?}, sub {:?}",
+            .unwrap_or_else(|| {
+                panic!(
+                    "join failed: path: {:?}, parent {:?}, link: {}",
+                    path,
                     path.parent(),
-                    link_path
+                    link
                 )
-            })?
+            })
     } else {
         link_path.to_path_buf()
     };
-    Ok(Link::Local(link_path))
+    Link::Local(link_path)
 }
 
+/// 检查link是否是一个可用的image链接。
+///
+/// - 对于url link，使用http head方法访问检查content type
+/// - 对于local path使用extension与magic number双重检查
 async fn check_link(client: &Client, link: &Link) -> Result<(), LinkCheckError> {
     trace!("checking link: {}", link.to_string());
     match link {
@@ -386,17 +401,9 @@ async fn check_link_net(client: &Client, url: &str) -> Result<(), LinkCheckError
         .send()
         .await
         .map_err(|e| LinkCheckError::Other(e.into()))?;
-    if log::log_enabled!(log::Level::Trace) {
-        log::trace!(
-            "got resp for url: {}, status: {}, headers: {:?}",
-            url,
-            resp.status(),
-            resp.headers().iter().collect::<Vec<_>>()
-        );
-    }
 
+    let status = resp.status().as_u16();
     if resp.status().is_success() {
-        let status = resp.status().as_u16();
         let head_val = resp
             .headers()
             .get("Content-Type")
@@ -419,18 +426,18 @@ async fn check_link_net(client: &Client, url: &str) -> Result<(), LinkCheckError
                 "content-type: {}",
                 head_val
             )));
-        } else {
-            // failed on status
-            debug!(
-                "unsuccessful status: {}, headers: {:?}",
-                status,
-                resp.headers()
-            );
-            return Err(LinkCheckError::HeadFailed(
-                status,
-                "unsuccessful status".to_string(),
-            ));
         }
+    } else {
+        // failed on status
+        debug!(
+            "unsuccessful status: {}, headers: {:?}",
+            status,
+            resp.headers()
+        );
+        return Err(LinkCheckError::HeadFailed(
+            status,
+            "unsuccessful status".to_string(),
+        ));
     }
     Ok(())
 }
@@ -438,14 +445,14 @@ async fn check_link_net(client: &Client, url: &str) -> Result<(), LinkCheckError
 async fn load_image(client: &Client, link: &Link) -> Result<Vec<u8>> {
     match link {
         Link::Local(path) => {
-            log::trace!("reading from path: {:?}", path.to_str());
+            trace!("reading from path: {:?}", path.to_str());
             afs::read(path).await.map_err(Into::into)
         }
         Link::Net(url) => {
-            log::trace!("requesting with url: {}", url);
+            trace!("sending get request to load image: {}", url);
             let resp = client.get(url.as_str()).send().await?;
             if !resp.status().is_success() {
-                log::warn!(
+                warn!(
                     "request failed for url: {}, status: {}, body.text: {}",
                     url,
                     resp.status(),
@@ -456,6 +463,28 @@ async fn load_image(client: &Client, link: &Link) -> Result<Vec<u8>> {
             resp.bytes().await.map(|b| b.to_vec()).map_err(Into::into)
         }
     }
+}
+
+fn get_link_name(link: &str) -> String {
+    link.parse::<Url>()
+        .ok()
+        .and_then(|url| {
+            url.path_segments()
+                .and_then(|items| items.last().map(|s| s.to_string()))
+        })
+        .or_else(|| {
+            Path::new(link)
+                .file_name()
+                .and_then(|s| s.to_str().map(|s| s.to_string()))
+        })
+        .unwrap_or_else(|| {
+            let name = "none".to_string();
+            warn!(
+                "not found filename in link: {}, replace it with the default name: {}",
+                link, name
+            );
+            name
+        })
 }
 
 /// 从text中替换所有存在links中的链接为value.base64的硬编码格式值：
@@ -472,36 +501,15 @@ fn replace(text: &str, links: &HashMap<String, (String, ImageFormat)>) -> String
         "\n\n<!-- auto generated by mdutil at {} -->\n\n",
         humantime::format_rfc3339(SystemTime::now())
     );
-    log::debug!("start using regular substitution links: {}", links.len());
     let mut new_text = RE_IMAGE
         .replace_all(text, |caps: &Captures| {
             let (original, link) = (caps[0].to_string(), &caps[2]);
             // 1. get key
             if let Some((b64, fmt)) = links.get(&original) {
-                let id = match link.parse::<Link>() {
-                    Ok(Link::Local(p)) => p
-                        .file_name()
-                        .and_then(|s| s.to_str().map(|s| s.to_string())),
-                    Ok(Link::Net(url)) => url
-                        .path_segments()
-                        .and_then(|items| items.last().map(|s| s.to_string())),
-                    // ignore
-                    _ => return original,
-                }
-                // `0_file.jpg`
-                .map(|s| format!("{}_{}", count, s))
-                // `0_none`
-                .unwrap_or_else(|| {
-                    log::debug!(
-                        "not found filename in link: {}, replace it with the default name: none",
-                        link
-                    );
-                    format!("{}_none", count)
-                });
-
+                let id = format!("{}_{}", count, get_link_name(link));
                 // 2. get replaced name, use id to index `![alt text][id]`
                 let new = format!("![{}][{}]", &caps[1], id);
-                log::info!("replacing link `{}` with `{}`", original, new);
+                info!("replacing image link `{}` with `{}`", original, new);
 
                 // 3. append to the end
                 encoded_text.push_str(&format!(
@@ -525,197 +533,208 @@ fn replace(text: &str, links: &HashMap<String, (String, ImageFormat)>) -> String
     new_text
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::DATA_DIR;
+    use std::time::Duration;
 
-//     static DATA: &str = r#"
-// # markdown util
+    static DATA: &str = r#"
+# markdown util
 
-// the test
+the test
 
-// ![absolutely local image](/home/navyd/Workspaces/projects/blog-resources/assets/images/0c1c6c89-5dfb-4a5e-a4c5-6aac1b299b37.png)
+![absolutely local image](/home/navyd/Workspaces/projects/blog-resources/assets/images/0c1c6c89-5dfb-4a5e-a4c5-6aac1b299b37.png)
 
-// ![test image](test/test.png)
+![test image](test/test.png)
 
-// ![not exist image](test/_not_exists_test.png)
+![not exist image](test/_not_exists_test.png)
 
-// ![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)
+![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)
 
-// ![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)"#;
+![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)"#;
 
-//     static CLIENT: Lazy<Client> = Lazy::new(|| Client::builder().build().unwrap());
+    static CLIENT: Lazy<Client> = Lazy::new(|| Client::builder().build().unwrap());
+    static ARGS: CheckerArgs = CheckerArgs {
+        connect_timeout: Duration::from_secs(3),
+        image_link_type: LinkType::All,
+    };
 
-//     static DATA_DIR: Lazy<PathBuf> = Lazy::new(|| "tests/resources".parse().unwrap());
+    static CHECKER: Lazy<Checker> = Lazy::new(|| Checker::new(ARGS.clone()));
 
-//     #[tokio::test]
-//     async fn test_check() -> Result<()> {
-//         let checker = Checker::new();
-//         let mut path = DATA_DIR.clone();
-//         path.push("test.md");
+    #[tokio::test]
+    async fn test_check() -> Result<()> {
+        let checker = Checker::new(ARGS.clone());
+        let path = DATA_DIR.join("test.md");
 
-//         let infos = checker.check(path, LinkType::All).await?;
-//         assert_eq!(infos.len(), 5);
-//         assert_eq!(infos.iter().filter(|info| info.error.is_some()).count(), 2);
-//         Ok(())
-//     }
+        let infos = checker.check(path).await?;
+        assert_eq!(infos.len(), 5);
+        assert_eq!(infos.iter().filter(|info| info.error.is_some()).count(), 2);
+        Ok(())
+    }
 
-//     #[tokio::test]
-//     async fn convert_image_to_base64() -> Result<()> {
-//         let converter = Checker::new();
-//         let old = DATA;
-//         let new = converter.embed_base64(old, LinkType::All).await?;
-//         assert!(!new.is_empty());
-//         assert!(new.len() > old.len());
-//         assert!(new.lines().count() > old.lines().count());
-//         assert!(new.contains("# markdown util"));
-//         assert!(!new.contains("![test image](test/test.png)"));
+    #[tokio::test]
+    async fn convert_image_to_base64() -> Result<()> {
+        let checker = CHECKER.clone();
+        let path = DATA_DIR.join("test.md");
+        let (new, faileds) = checker.embed_base64(&path).await?;
+        let old = read_to_string(&path)?;
 
-//         assert!(new.contains("![not exist image](test/_not_exists_test.png)"));
-//         assert!(new.contains("![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)"));
+        assert_eq!(faileds.len(), 2);
+        assert!(faileds.iter().all(|e| {
+            let s = e.root_cause().to_string();
+            e.downcast_ref::<Link>().is_some()
+                && (s.contains("not exist or is file") || s.contains("unexpected EOF"))
+        }));
+        assert!(!new.is_empty());
+        assert!(new.len() > old.len());
+        // to compare first line
+        assert_eq!(new.lines().next(), old.lines().next());
+        assert!(new.lines().count() > old.lines().count());
+        let link = "![test image](test.png)";
+        assert!(!new.contains(link) && old.contains(link));
 
-//         let new = converter.embed_base64(old, LinkType::Local).await?;
-//         assert!(new.contains("![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)"));
-//         assert!(new
-//             .contains("![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)"));
-//         assert!(new.contains("![not exist image](test/_not_exists_test.png)"));
-//         assert!(!new.contains("![test image](test/test.png)"));
+        let link = "![not exist image](test/_not_exists_test.png)";
+        assert!(new.contains(link) && old.contains(link));
 
-//         let new = converter.embed_base64(old, LinkType::Net).await?;
-//         assert!(!new
-//             .contains("![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)"));
-//         Ok(())
-//     }
+        let link = "![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)";
+        assert!(!new.contains(link) && old.contains(link));
 
-//     #[tokio::test]
-//     async fn test_check_links() -> Result<()> {
-//         assert!(check_link(
-//             &CLIENT,
-//             &Link::Net(
-//                 "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png".parse()?
-//             ),
-//         )
-//         .await
-//         .is_ok());
-//         assert!(check_link(
-//             &CLIENT,
-//             &Link::Net("https://fsafthe234notexist.com/a/b/c_aaaa/a.png".parse()?)
-//         )
-//         .await
-//         .is_err());
+        let link = "![](https://fsafthe234notexist.com/a/b/c_aaaa/a.png)";
+        assert!(new.contains(link) && old.contains(link));
 
-//         assert!(check_link(
-//             &CLIENT,
-//             &Link::Local(format!("{}/_not_exists_test.png", DATA_DIR.to_str().unwrap()).parse()?)
-//         )
-//         .await
-//         .is_err());
-//         assert!(check_link(
-//             &CLIENT,
-//             &Link::Local(format!("{}/test.png", DATA_DIR.to_str().unwrap()).parse()?)
-//         )
-//         .await
-//         .is_ok());
-//         Ok(())
-//     }
+        Ok(())
+    }
 
-//     #[test]
-//     fn valid_image_format() -> Result<()> {
-//         let buf = std::fs::read(format!("{}/test.png", DATA_DIR.to_str().unwrap()))?;
-//         assert_eq!(ImageFormat::Png, ImageFormat::try_from(&buf[..])?);
+    #[tokio::test]
+    async fn test_check_links() -> Result<()> {
+        assert!(check_link(
+            &CLIENT,
+            &Link::Net(
+                "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png".parse()?
+            ),
+        )
+        .await
+        .is_ok());
+        assert!(check_link(
+            &CLIENT,
+            &Link::Net("https://fsafthe234notexist.com/a/b/c_aaaa/a.png".parse()?)
+        )
+        .await
+        .is_err());
 
-//         let buf = std::fs::read(format!("{}/test.md", DATA_DIR.to_str().unwrap()))?;
-//         assert!(ImageFormat::try_from(&buf[..]).is_err());
-//         Ok(())
-//     }
+        assert!(check_link(
+            &CLIENT,
+            &Link::Local(format!("{}/_not_exists_test.png", DATA_DIR.to_str().unwrap()).parse()?)
+        )
+        .await
+        .is_err());
+        assert!(check_link(
+            &CLIENT,
+            &Link::Local(format!("{}/test.png", DATA_DIR.to_str().unwrap()).parse()?)
+        )
+        .await
+        .is_ok());
+        Ok(())
+    }
 
-//     #[tokio::test]
-//     async fn test_load_image() -> Result<()> {
-//         let link = "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png";
-//         assert!(!load_image(&CLIENT, &Link::Net(link.parse()?))
-//             .await?
-//             .is_empty());
+    #[test]
+    fn valid_image_format() -> Result<()> {
+        let buf = std::fs::read(format!("{}/test.png", DATA_DIR.to_str().unwrap()))?;
+        assert_eq!(ImageFormat::Png, ImageFormat::try_from(&buf[..])?);
 
-//         let link = format!("{}/test.png", DATA_DIR.to_str().unwrap());
-//         assert!(!load_image(&CLIENT, &Link::Local(link.parse()?))
-//             .await?
-//             .is_empty());
+        let buf = std::fs::read(format!("{}/test.md", DATA_DIR.to_str().unwrap()))?;
+        assert!(ImageFormat::try_from(&buf[..]).is_err());
+        Ok(())
+    }
 
-//         let link = format!("{}/_not/exist/_file.png", DATA_DIR.to_str().unwrap());
-//         assert!(load_image(&CLIENT, &Link::Local(link.parse()?))
-//             .await
-//             .is_err());
-//         Ok(())
-//     }
+    #[tokio::test]
+    async fn test_load_image() -> Result<()> {
+        let link = "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png";
+        assert!(!load_image(&CLIENT, &Link::Net(link.parse()?))
+            .await?
+            .is_empty());
 
-//     #[test]
-//     fn test_parse_link() -> Result<()> {
-//         let mut md_path = DATA_DIR.to_path_buf();
-//         md_path.push("test.md");
+        let link = format!("{}/test.png", DATA_DIR.to_str().unwrap());
+        assert!(!load_image(&CLIENT, &Link::Local(link.parse()?))
+            .await?
+            .is_empty());
 
-//         let link = "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png";
-//         assert_eq!(parse_link(&md_path, link)?, Link::Net(link.parse()?));
+        let link = format!("{}/_not/exist/_file.png", DATA_DIR.to_str().unwrap());
+        assert!(load_image(&CLIENT, &Link::Local(link.parse()?))
+            .await
+            .is_err());
+        Ok(())
+    }
 
-//         let link = "test.png";
-//         assert_eq!(
-//             parse_link(&md_path, link)?,
-//             Link::Local(
-//                 format!(
-//                     "{}/{}",
-//                     md_path.parent().and_then(|s| s.to_str()).unwrap(),
-//                     link
-//                 )
-//                 .parse()?
-//             )
-//         );
+    #[test]
+    fn test_parse_link() -> Result<()> {
+        let mut md_path = DATA_DIR.to_path_buf();
+        md_path.push("test.md");
 
-//         let link = "_not/exist/_file.png";
-//         assert_eq!(
-//             parse_link(&md_path, link)?,
-//             Link::Local(
-//                 format!(
-//                     "{}/{}",
-//                     md_path.parent().and_then(|s| s.to_str()).unwrap(),
-//                     link
-//                 )
-//                 .parse()?
-//             )
-//         );
+        let link = "https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png";
+        assert_eq!(parse_link(&md_path, link), Link::Net(link.parse()?));
 
-//         // 不验证path
-//         let link = "_not/exis.fsdfsdf.sdfdsf./sdfds.fdsfs";
-//         md_path.push("noexist_dir");
-//         assert_eq!(
-//             parse_link(&md_path, link)?,
-//             Link::Local(
-//                 format!(
-//                     "{}/{}",
-//                     md_path.parent().and_then(|s| s.to_str()).unwrap(),
-//                     link
-//                 )
-//                 .parse()?
-//             )
-//         );
-//         Ok(())
-//     }
+        let link = "test.png";
+        assert_eq!(
+            parse_link(&md_path, link),
+            Link::Local(
+                format!(
+                    "{}/{}",
+                    md_path.parent().and_then(|s| s.to_str()).unwrap(),
+                    link
+                )
+                .parse()?
+            )
+        );
 
-//     #[test]
-//     fn replace_with_links() -> Result<()> {
-//         let mut links = HashMap::new();
-//         links.insert(
-//             "![test image](test/test.png)".to_string(),
-//             ("base64testaaabb".to_string(), ImageFormat::Png),
-//         );
-//         links.insert(
-//             "![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)".to_string(),
-//             ("base64testaaabbcccccc".to_string(), ImageFormat::Png),
-//         );
-//         let old = DATA;
-//         let new = replace(old, &links);
-//         assert!(new.len() > old.len());
-//         assert!(!new.contains("![test image](test/test.png)"));
-//         // image id with base64 encoded: `[id]:data:image/png;base64,base64_encode`
-//         assert!(new.contains("[1_PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png]:data:image/png;base64,base64testaaabbcccccc"));
-//         Ok(())
-//     }
-// }
+        let link = "_not/exist/_file.png";
+        assert_eq!(
+            parse_link(&md_path, link),
+            Link::Local(
+                format!(
+                    "{}/{}",
+                    md_path.parent().and_then(|s| s.to_str()).unwrap(),
+                    link
+                )
+                .parse()?
+            )
+        );
+
+        // 不验证path
+        let link = "_not/exis.fsdfsdf.sdfdsf./sdfds.fdsfs";
+        md_path.push("noexist_dir");
+        assert_eq!(
+            parse_link(&md_path, link),
+            Link::Local(
+                format!(
+                    "{}/{}",
+                    md_path.parent().and_then(|s| s.to_str()).unwrap(),
+                    link
+                )
+                .parse()?
+            )
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn replace_with_links() -> Result<()> {
+        let mut links = HashMap::new();
+        links.insert(
+            "![test image](test/test.png)".to_string(),
+            ("base64testaaabb".to_string(), ImageFormat::Png),
+        );
+        links.insert(
+            "![](https://www.baidu.com/img/PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png)".to_string(),
+            ("base64testaaabbcccccc".to_string(), ImageFormat::Png),
+        );
+        let old = DATA;
+        let new = replace(old, &links);
+        assert!(new.len() > old.len());
+        assert!(!new.contains("![test image](test/test.png)"));
+        // image id with base64 encoded: `[id]:data:image/png;base64,base64_encode`
+        assert!(new.contains("[1_PCtm_d9c8750bed0b3c7d089fa7d55720d6cf.png]:data:image/png;base64,base64testaaabbcccccc"));
+        Ok(())
+    }
+}
