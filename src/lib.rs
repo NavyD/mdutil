@@ -1,5 +1,15 @@
+use once_cell::sync::Lazy;
+
 pub mod cmd;
 pub mod image;
+
+pub static CRATE_NAME: Lazy<String> = Lazy::new(|| {
+    module_path!()
+        .split("::")
+        .next()
+        .map(ToString::to_string)
+        .expect("get module_path error")
+});
 
 #[cfg(test)]
 pub mod tests {
@@ -14,15 +24,13 @@ pub mod tests {
     #[cfg(test)]
     #[ctor::ctor]
     fn init() {
+        use crate::CRATE_NAME;
+
         INIT.call_once(|| {
-            let crate_name = module_path!()
-                .split("::")
-                .next()
-                .expect("get module_path error");
             env_logger::builder()
                 .is_test(true)
                 .filter_level(LevelFilter::Info)
-                .filter_module(crate_name, LevelFilter::Trace)
+                .filter_module(&CRATE_NAME, LevelFilter::Trace)
                 .init();
         });
     }

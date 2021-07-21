@@ -224,13 +224,20 @@ impl Checker {
             };
         }
 
-        info!(
+        trace!(
             "there are {} tasks and {} failed for {}",
             jobs_size,
             err_links.len(),
             path_str
         );
-        debug!("replacing {} links for {}", links.len(), path_str);
+        if links.is_empty() {
+            info!("skip replacement because no link is available. all link tasks: {}, failed links: {}", 
+                jobs_size, 
+                err_links.len()
+            );
+            return Ok((text, err_links));
+        }
+        debug!("replacing {} in all {} links for {}", links.len(), jobs_size, path_str);
         Ok((replace(&text, &links), err_links))
     }
 

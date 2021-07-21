@@ -1,10 +1,12 @@
 use crate::image::{Checker, Link, LinkType};
+use crate::CRATE_NAME;
 use anyhow::{anyhow, Error, Result};
 use futures::future;
 use log::{error, info, warn};
 use std::collections::HashSet;
 use std::fs;
 use std::fs::{create_dir, create_dir_all};
+use std::io::stdout;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use structopt::StructOpt;
@@ -25,17 +27,20 @@ enum Opt {
         #[structopt(short, long, parse(from_os_str))]
         output: PathBuf,
     },
+
+    Completion,
 }
 
 impl Opt {
-    fn common(&self) -> &Common {
+    fn common(&self) -> Option<&Common> {
         match self {
-            Opt::Check { common, args: _ } => common,
+            Opt::Check { common, args: _ } => Some(common),
             Opt::Replace {
                 common,
                 args: _,
                 output: _,
-            } => common,
+            } => Some(common),
+            Opt::Completion => None,
         }
     }
 }
@@ -60,9 +65,9 @@ struct Common {
     #[structopt(short = "v", parse(from_occurrences))]
     verbose: u8,
 
-    /// Input files
+    /// path of input files
     #[structopt(parse(from_os_str))]
-    input: Vec<PathBuf>,
+    paths: Vec<PathBuf>,
 
     /// use `,` limit the markdown docs. like `--extensions md,markdown,mk`.
     /// default md
@@ -81,15 +86,29 @@ fn parse_extensions(s: &str) -> HashSet<String> {
 
 pub async fn run() -> Result<()> {
     let opt = Opt::from_args();
-    init_log(opt.common().verbose)?;
+    if let Some(common) = opt.common() {
+        init_log(common.verbose)?;
+    }
 
-    let paths = opt.common().load_input_paths()?;
     match opt {
-        Opt::Check { common: _, args } => {
+        Opt::Check { common, args } => {
+            let paths = common.load_input_paths()?;
             let checker = Checker::new(args);
             do_check(&paths, &checker).await;
         }
-        Opt::Replace { args, output, .. } => do_replace(&paths, &output, args).await,
+        Opt::Replace {
+            args,
+            output,
+            common,
+        } => {
+            let paths = common.load_input_paths()?;
+            do_replace(&paths, &output, args).await
+        }
+        Opt::Completion => {
+            use structopt::clap::Shell;
+            Opt::clap().gen_completions_to(CRATE_NAME.as_str(), Shell::Zsh, &mut stdout());
+            return Ok(());
+        }
     }
     Ok(())
 }
@@ -113,51 +132,7 @@ async fn do_replace(inputs: &[PathBuf], output: &Path, args: CheckerArgs) {
     let checker = Checker::new(args);
     let jobs = inputs
         .iter()
-        .filter(|path| {
-            let parent = output.join(&path);
-            let parent = parent.parent().unwrap();
-            if parent.exists() {
-                return true;
-            }
-            if let Err(e) = create_dir_all(&parent) {
-                error!("create out dir {:?} error: {}", parent, e);
-                false
-            } else {
-                true
-            }
-        })
-        .map(|p| {
-            let checker = checker.clone();
-            let path = p.to_path_buf();
-            let out_path = output.clone().join(&path);
-            tokio::spawn(async move {
-                let (text, errs) = checker.embed_base64(&path).await?;
-                let mut out_text = "".to_string();
-                if !errs.is_empty() {
-                    out_text += &format!("found {} errors in {:?}\n", errs.len(), path);
-                    out_text = errs.iter().fold(out_text, |mut acc, e| {
-                        acc += &format!(
-                            "link: {}, cause: {}\n",
-                            e.downcast_ref::<Link>().unwrap(),
-                            e.root_cause()
-                        );
-                        acc
-                    });
-                }
-                info!(
-                    "writing replacement result to path {:?} from {:?}",
-                    out_path, path
-                );
-                out_text += "\n";
-                if let Err(e) = fs::write(&out_path, text) {
-                    out_text += &format!("\nwrite {:?} failed: {}\n", out_path, e);
-                    eprintln!("{}", out_text);
-                } else {
-                    println!("{}", out_text);
-                }
-                Ok::<_, Error>(())
-            })
-        })
+        .map(|path| tokio::spawn(embed_task(path.clone(), output.clone(), checker.clone())))
         .collect::<Vec<_>>();
 
     for job in future::join_all(jobs).await {
@@ -166,6 +141,46 @@ async fn do_replace(inputs: &[PathBuf], output: &Path, args: CheckerArgs) {
         }
     }
     println!("all replace tasks completed");
+}
+
+async fn embed_task(path: PathBuf, output: PathBuf, checker: Checker) -> Result<()> {
+    // join check. temporary solution
+    if path.is_absolute() {
+        return Err(anyhow!(
+            "unsupported absolutely path `{:?}` with output: {:?}",
+            path,
+            output
+        ));
+    }
+    let output = output.join(&path);
+    let parent = output
+        .parent()
+        .ok_or_else(|| anyhow!("no parent in path: {:?}", output))?;
+    if !parent.exists() {
+        info!("creating all parent dir for {:?}", output);
+        create_dir_all(parent).map_err::<Error, _>(Into::into)?;
+    }
+
+    let (text, errs) = checker.embed_base64(&path).await?;
+    let mut msg = "".to_string();
+    if !errs.is_empty() {
+        msg += &format!("found {} errors in {:?}\n", errs.len(), path);
+        msg = errs.iter().fold(msg, |mut acc, e| {
+            acc += &format!(
+                "link: {}, cause: {}\n",
+                e.downcast_ref::<Link>().unwrap(),
+                e.root_cause()
+            );
+            acc
+        });
+    }
+    info!(
+        "writing replacement result to path {:?} from {:?}",
+        output, path
+    );
+    fs::write(&output, text).map_err::<Error, _>(Into::into)?;
+    println!("{}", msg);
+    Ok(())
 }
 
 async fn do_check(paths: &[PathBuf], checker: &Checker) {
@@ -220,67 +235,40 @@ fn init_log(verbose: u8) -> Result<()> {
 }
 
 impl Common {
+    /// 从self.paths中读取md文件。
+    ///
+    /// todo: concurrent reading
     fn load_input_paths(&self) -> Result<Vec<PathBuf>> {
-        info!("loading all paths from {:?}", self.input);
-        if self.input.is_empty() {
+        info!("loading all paths from {:?}", self.paths);
+        if self.paths.is_empty() {
             return Err(anyhow!("empty input paths"));
-        }
-        // distinct input paths
-        let filtered_input_paths = self
-            .input
-            .iter()
-            .map(|p| p.canonicalize())
-            .filter(|p| match p {
-                Ok(_) => true,
-                Err(e) => {
-                    error!("{:?} canonicalize failed: {}", p, e);
-                    false
-                }
-            })
-            .map(Result::unwrap)
-            .collect::<HashSet<_>>();
-
-        if filtered_input_paths.len() < self.input.len() {
-            warn!(
-                "found duplicate in input paths: {:?}. filtered paths: {:?}",
-                self.input, filtered_input_paths
-            );
         }
 
         let mut distinct = HashSet::new();
         let mut paths = vec![];
-        for path in &self.input {
-            for subpath in self.load_paths(&path)? {
-                let p = subpath.canonicalize()?;
-                let s = p.to_str().unwrap().to_string();
-                if !distinct.insert(p) {
-                    info!("duplicative path {} in top path: {:?}", s, path);
+        for input in &self.paths {
+            for path in self.load_md_paths(&input)? {
+                let ca_path = path.canonicalize()?;
+                let s = ca_path
+                    .to_str()
+                    .ok_or_else(|| anyhow!("to str error"))
+                    .map(ToString::to_string)?;
+                if !distinct.insert(ca_path) {
+                    info!("duplicate path {} in top path: {:?}", s, input);
                     continue;
                 }
-                paths.push(subpath);
+                paths.push(path);
             }
         }
+        info!(
+            "loaded {} markdown files in input paths: {:?}",
+            paths.len(),
+            self.paths
+        );
         Ok(paths)
-        // scan all distinct paths
-        // let mut paths = HashSet::new();
-        // for path in filtered_input_paths {
-        //     for p in self.load_paths(&path)? {
-        //         let p = p.canonicalize()?;
-        //         let s = p.to_str().unwrap().to_string();
-        //         if !paths.insert(p) {
-        //             info!("duplicative path {} in top path: {:?}", s, path);
-        //         }
-        //     }
-        // }
-        // info!(
-        //     "loaded {} markdown files in {} top paths",
-        //     paths.len(),
-        //     self.input.len()
-        // );
-        // Ok(paths.into_iter().collect())
     }
 
-    fn load_paths(&self, path: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
+    fn load_md_paths(&self, path: impl AsRef<Path>) -> Result<Vec<PathBuf>> {
         let path = path.as_ref();
         log::trace!("loading from {:?}", path);
         if !path.exists() {
@@ -315,23 +303,6 @@ impl Common {
             .filter(|p| self.is_markdown_file(p))
             .collect())
     }
-
-    // fn load(path: &Path) -> Result<Vec<PathBuf>> {
-    //     let a = fs::read_dir(path)?
-    //         .collect::<Vec<_>>()
-    //         .par_iter()
-    //         .filter(|entry| {
-    //             if let Err(e) = entry {
-    //                 warn!("read dir {:?} failed: {}", path, e);
-    //                 false
-    //             } else {
-    //                 true
-    //             }
-    //         })
-    //         .map(|res| res.as_ref().unwrap())
-    //         ;
-    //     todo!()
-    // }
 
     fn is_markdown_file(&self, path: impl AsRef<Path>) -> bool {
         let path = path.as_ref();
